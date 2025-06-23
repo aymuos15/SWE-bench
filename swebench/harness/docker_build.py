@@ -4,6 +4,7 @@ import docker
 import docker.errors
 import logging
 import sys
+import time
 import traceback
 
 from pathlib import Path
@@ -96,34 +97,41 @@ def build_image(
     """
     # Create a logger for the build process
     logger = setup_logger(image_name, build_dir / "build_image.log")
-    logger.info(
-        f"Building image {image_name}\n"
-        f"Using dockerfile:\n{dockerfile}\n"
-        f"Adding ({len(setup_scripts)}) setup scripts to image build repo"
-    )
-
-    for setup_script_name, setup_script in setup_scripts.items():
-        logger.info(f"[SETUP SCRIPT] {setup_script_name}:\n{setup_script}")
+    start_time = time.time()
+    
+    logger.info(f"{'='*50}")
+    logger.info(f"STARTING BUILD: {image_name}")
+    logger.info(f"{'='*50}")
+    logger.info(f"Build directory: {build_dir}")
+    logger.info(f"Platform: {platform}")
+    logger.info(f"Using cache: {not nocache}")
+    logger.info(f"Number of setup scripts: {len(setup_scripts)}")
+    
+    print(f"\n[BUILD] Starting build for {image_name}")
+    
     try:
         # Write the setup scripts to the build directory
+        logger.info("Writing setup scripts...")
         for setup_script_name, setup_script in setup_scripts.items():
             setup_script_path = build_dir / setup_script_name
             with open(setup_script_path, "w") as f:
                 f.write(setup_script)
             if setup_script_name not in dockerfile:
-                logger.warning(
-                    f"Setup script {setup_script_name} may not be used in Dockerfile"
-                )
-
+                logger.warning(f"Setup script {setup_script_name} may not be used in Dockerfile")
+        
         # Write the dockerfile to the build directory
         dockerfile_path = build_dir / "Dockerfile"
         with open(dockerfile_path, "w") as f:
             f.write(dockerfile)
-
+        
+        # Log Dockerfile for reference
+        logger.info(f"Dockerfile contents:\n{dockerfile}")
+        
         # Build the image
-        logger.info(
-            f"Building docker image {image_name} in {build_dir} with platform {platform}"
-        )
+        logger.info(f"Starting Docker build for {image_name}")
+        print(f"[BUILD] Building {image_name}...")
+        
+        build_start = time.time()
         response = client.api.build(
             path=str(build_dir),
             tag=image_name,
@@ -133,31 +141,71 @@ def build_image(
             platform=platform,
             nocache=nocache,
         )
-
-        # Log the build process continuously
+        
+        # Track build steps and progress
+        step_count = 0
+        current_step = 0
         buildlog = ""
+        
+        # First pass to count total steps
+        dockerfile_lines = dockerfile.split('\n')
+        step_count = sum(1 for line in dockerfile_lines if line.strip().startswith(('RUN', 'COPY', 'ADD', 'CMD', 'ENTRYPOINT')))
+        
+        logger.info(f"Build will execute approximately {step_count} steps")
+        
+        # Process build output
         for chunk in response:
             if "stream" in chunk:
-                # Remove ANSI escape sequences from the log
-                chunk_stream = ansi_escape(chunk["stream"])
-                logger.info(chunk_stream.strip())
-                buildlog += chunk_stream
+                chunk_stream = ansi_escape(chunk["stream"]).strip()
+                if chunk_stream:
+                    # Check for step completion
+                    if chunk_stream.startswith("Step "):
+                        current_step += 1
+                        progress = f"[{current_step}/{step_count}]" if step_count > 0 else ""
+                        print(f"[BUILD] {progress} {chunk_stream}")
+                    
+                    # Log the output
+                    logger.info(chunk_stream)
+                    buildlog += chunk_stream + "\n"
+                    
+                    # Show progress for long-running steps
+                    if any(x in chunk_stream.lower() for x in ["installing", "downloading", "building", "compiling"]):
+                        print(f"[BUILD] {chunk_stream}")
+                        
+            elif "status" in chunk:
+                status = chunk["status"].strip()
+                if "progress" in chunk and "id" in chunk:
+                    # Show progress for download/extraction steps
+                    progress = chunk.get("progressDetail", {})
+                    if "current" in progress and "total" in progress and progress["total"] > 0:
+                        pct = (progress["current"] / progress["total"]) * 100
+                        print(f"[BUILD] {status}: {pct:.1f}%", end="\r")
+            
             elif "errorDetail" in chunk:
-                # Decode error message, raise BuildError
-                logger.error(
-                    f"Error: {ansi_escape(chunk['errorDetail']['message'])}"
-                )
-                raise docker.errors.BuildError(
-                    chunk["errorDetail"]["message"], buildlog
-                )
-        logger.info("Image built successfully!")
+                error_msg = ansi_escape(chunk["errorDetail"].get("message", "Unknown error"))
+                logger.error(f"Build error: {error_msg}")
+                print(f"[ERROR] Build failed: {error_msg}")
+                raise docker.errors.BuildError(error_msg, buildlog)
+        
+        build_time = time.time() - build_start
+        logger.info(f"Build completed successfully in {build_time:.2f} seconds")
+        print(f"[BUILD] ✓ Successfully built {image_name} in {build_time:.1f}s")
+        
     except docker.errors.BuildError as e:
-        logger.error(f"docker.errors.BuildError during {image_name}: {e}")
-        raise BuildImageError(image_name, str(e), logger) from e
+        error_msg = str(e)
+        logger.error(f"Build failed: {error_msg}")
+        print(f"[ERROR] Build failed: {error_msg}")
+        raise BuildImageError(image_name, error_msg, logger) from e
+        
     except Exception as e:
-        logger.error(f"Error building image {image_name}: {e}")
-        raise BuildImageError(image_name, str(e), logger) from e
+        error_msg = str(e)
+        logger.error(f"Unexpected error: {error_msg}")
+        print(f"[ERROR] Unexpected error: {error_msg}")
+        raise BuildImageError(image_name, error_msg, logger) from e
+        
     finally:
+        total_time = time.time() - start_time
+        logger.info(f"Total build time: {total_time:.2f} seconds")
         close_logger(logger)  # functions that create loggers should close them
 
 
@@ -266,20 +314,35 @@ def build_env_images(
         force_rebuild (bool): Whether to force rebuild the images even if they already exist
         max_workers (int): Maximum number of workers to use for building images
     """
+    print("\n" + "="*50)
+    print("BUILDING ENVIRONMENT IMAGES")
+    print("="*50)
+    
     # Get the environment images to build from the dataset
     if force_rebuild:
         env_image_keys = {x.env_image_key for x in get_test_specs_from_dataset(dataset)}
+        print(f"Force rebuild enabled - removing {len(env_image_keys)} existing images")
         for key in env_image_keys:
             remove_image(client, key, "quiet")
+    
+    # Build base images first
+    print("\nBuilding base images...")
     build_base_images(client, dataset, force_rebuild)
+    
+    # Get configs for environment images that need to be built
     configs_to_build = get_env_configs_to_build(client, dataset)
     if len(configs_to_build) == 0:
-        print("No environment images need to be built.")
+        print("\n✓ No environment images need to be built.")
         return [], []
-    print(f"Total environment images to build: {len(configs_to_build)}")
-
-    args_list = list()
+        
+    print(f"\nPreparing to build {len(configs_to_build)} environment images...")
+    
+    # Prepare build arguments
+    args_list = []
     for image_name, config in configs_to_build.items():
+        build_dir = ENV_IMAGE_BUILD_DIR / image_name.replace(":", "__")
+        build_dir.mkdir(parents=True, exist_ok=True)
+        
         args_list.append(
             (
                 image_name,
@@ -287,17 +350,30 @@ def build_env_images(
                 config["dockerfile"],
                 config["platform"],
                 client,
-                ENV_IMAGE_BUILD_DIR / image_name.replace(":", "__"),
+                build_dir,
             )
         )
-
+    
+    # Track build progress
+    print(f"\nStarting builds with {max_workers} parallel workers...")
+    start_time = time.time()
+    
+    # Run builds in parallel
     successful, failed = run_threadpool(build_image, args_list, max_workers)
-    # Show how many images failed to build
-    if len(failed) == 0:
-        print("All environment images built successfully.")
-    else:
-        print(f"{len(failed)} environment images failed to build.")
-
+    
+    # Calculate and display build statistics
+    total_time = time.time() - start_time
+    print("\n" + "="*50)
+    print("BUILD SUMMARY")
+    print("="*50)
+    
+    if successful:
+        print(f"✓ Successfully built {len(successful)} images")
+    if failed:
+        print(f"✗ Failed to build {len(failed)} images")
+    
+    print(f"\nTotal build time: {total_time:.2f} seconds")
+    
     # Return the list of (un)successfuly built images
     return successful, failed
 
